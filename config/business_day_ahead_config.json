@@ -1,0 +1,51 @@
+{
+    "data_config": {
+        "feature_dict": {
+            "if_univariate": null,
+            "if_trend": null,
+            "has_timestamp": null,
+            "if_season": null
+        },
+        "data_set_name": "user_forecast"
+    },
+    "model_config": {
+        "models": [],
+        "recommend_model_hyper_params": {
+            "input_chunk_length": 96,
+            "output_chunk_length": 156,
+            "add_relative_index": true,
+            "norm": true,
+            "business_train": true,
+            "issue_hour": 9,
+            "evaluation_horizon": 96
+        }
+    },
+    "evaluation_config": {
+        "metrics": ["mae", "rmse"],
+        "strategy_args": {
+            "strategy_name": "business_day_ahead",
+            "horizon": 156,
+            "evaluation_horizon": 96,
+            "issue_hour": 9,
+            "evaluation_year": 2026,
+            "evaluation_month": 3,
+            "capacity": {
+                "ninghe_sr_0323_clean.csv": 80.4,
+                "ninghe_sr_0323_clean": 80.4,
+                "haojiaying_ws_0323_clean.csv": 50.0,
+                "haojiaying_ws_0323_clean": 50.0
+            },
+            "train_ratio_in_tv": 0.875,
+            "seed": 2021,
+            "deterministic": "efficient",
+            "save_true_pred": true,
+            "target_column": "power"
+        }
+    },
+    "report_config": {
+        "aggregate_type": "mean",
+        "report_metrics": ["mae", "rmse", "march_accuracy_mean"],
+        "fill_type": "mean_value",
+        "null_value_threshold": "0.3"
+    }
+}
