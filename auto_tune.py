@@ -610,7 +610,7 @@ def validate_params(params):
 
 
 def run_tune(search_space, base_args, n_trials, timeout, direction, db_path, log_file,
-             fixed_params, local_search_ratio=0.3):
+             fixed_params, model_defaults=None, local_search_ratio=0.3):
     """
     执行调参主循环。
 
@@ -636,9 +636,13 @@ def run_tune(search_space, base_args, n_trials, timeout, direction, db_path, log
         日志文件路径
     fixed_params : dict
         固定参数
+    model_defaults : dict, optional
+        模型默认常量，每次试验自动注入
     local_search_ratio : float
         局部搜索占比
     """
+    if model_defaults is None:
+        model_defaults = {}
     db = TrialDB(db_path)
     rng = random.Random(42)
     n_random = int(n_trials * (1 - local_search_ratio))
@@ -662,7 +666,12 @@ def run_tune(search_space, base_args, n_trials, timeout, direction, db_path, log
                 params = sample_params(search_space, rng)
                 strategy = "random"
 
-        # 添加固定参数
+        # 添加模型默认常量（最低优先级，不覆盖搜索/固定参数）
+        for key, val in model_defaults.items():
+            if key not in params:
+                params[key] = val
+
+        # 添加固定参数（覆盖搜索/默认参数）
         for key, val in fixed_params.items():
             params[key] = val
 
@@ -907,6 +916,11 @@ def main():
         help="固定参数 JSON 字符串 (如 '{\"seq_len\": 576}')",
     )
     parser.add_argument(
+        "--model-defaults",
+        default=None,
+        help="模型默认常量 JSON 字符串，每次试验自动注入 (如 '{\"loss\": \"MSE\", \"lradj\": \"type3\", \"n_heads\": 8}')",
+    )
+    parser.add_argument(
         "--project-root",
         default=None,
         help="项目根目录 (默认: 自动检测)",
@@ -936,6 +950,11 @@ def main():
     fixed_params = {}
     if args.fixed_params:
         fixed_params = json.loads(args.fixed_params)
+
+    # 模型默认常量（自动注入每次试验，不出现在搜索空间中）
+    model_defaults = {}
+    if args.model_defaults:
+        model_defaults = json.loads(args.model_defaults)
 
     # 输出目录
     os.makedirs(args.output_dir, exist_ok=True)
@@ -976,6 +995,8 @@ def main():
     print(f"共享数据库: {db_path}")
     if fixed_params:
         print(f"固定参数: {json.dumps(fixed_params)}")
+    if model_defaults:
+        print(f"模型默认常量: {json.dumps(model_defaults)}")
     if args.shared_db:
         print(f"并行模式: 已启用")
         print(f"  可在另一个终端运行相同命令来并行调参")
@@ -992,6 +1013,7 @@ def main():
         db_path=db_path,
         log_file=log_file,
         fixed_params=fixed_params,
+        model_defaults=model_defaults,
     )
 
     # 输出最终报告
