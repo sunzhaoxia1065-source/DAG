@@ -96,6 +96,11 @@ DEFAULT_SEARCH_SPACE = {
         "choices": [32, 64, 128],
         "comment": "批大小",
     },
+    "seq_len": {
+        "type": "categorical",
+        "choices": [96, 192, 288, 576],
+        "comment": "输入历史窗口长度（1/2/3/6天）",
+    },
     "patch_len": {
         "type": "categorical",
         "choices": [48, 96],
@@ -359,6 +364,9 @@ def run_trial_subprocess(params, base_args, trial_id, timeout_per_trial):
     save_path = os.path.join(base_args["output_dir"], f"trial_{trial_id}")
     os.makedirs(save_path, exist_ok=True)
 
+    # 使用绝对路径，确保子进程写入正确目录
+    abs_save_path = os.path.abspath(save_path)
+
     cmd = [
         sys.executable,
         os.path.join(base_args["project_root"], "scripts", "run_benchmark.py"),
@@ -377,7 +385,7 @@ def run_trial_subprocess(params, base_args, trial_id, timeout_per_trial):
         "--timeout",
         str(timeout_per_trial * 1000),
         "--save-path",
-        save_path,
+        abs_save_path,
     ]
 
     start_time = time.time()
@@ -393,7 +401,12 @@ def run_trial_subprocess(params, base_args, trial_id, timeout_per_trial):
         elapsed = time.time() - start_time
 
         if result.returncode != 0:
-            stderr_tail = result.stderr[-500:] if result.stderr else "unknown"
+            # 保留完整错误信息用于诊断
+            stderr_full = result.stderr or "unknown"
+            stderr_tail = stderr_full[-2000:]
+            # 同时打印到控制台方便调试
+            print(f"  [错误] 子进程返回码: {result.returncode}")
+            print(f"  [stderr 最后2000字符]:\n{stderr_tail}")
             return {
                 "status": "failed",
                 "metric": 0.0,
@@ -434,6 +447,12 @@ def parse_trial_result(save_path, metric_name="march_accuracy_mean"):
     """
     从试验输出目录解析评估指标。
 
+    搜索策略:
+    1. 递归搜索所有 CSV 和 tar.gz 文件
+    2. 尝试精确匹配 metric_name
+    3. 尝试模糊匹配（如 "accuracy" 匹配含 "accuracy" 的列名）
+    4. 尝试从 leaderboard 文件解析
+
     Parameters
     ----------
     save_path : str
@@ -448,23 +467,30 @@ def parse_trial_result(save_path, metric_name="march_accuracy_mean"):
     """
     save_dir = Path(save_path)
 
+    # 打印目录内容便于调试
+    if save_dir.exists():
+        all_files = list(save_dir.rglob("*"))
+        print(f"  [调试] 输出目录 {save_path} 包含 {len(all_files)} 个文件:")
+        for f in all_files[:20]:
+            print(f"    {f.relative_to(save_dir)}")
+        if len(all_files) > 20:
+            print(f"    ... 还有 {len(all_files) - 20} 个文件")
+
+    # 收集所有 CSV 文件（直接 + 解压 tar.gz）
+    csv_dataframes = []
+
     # 方式1: 直接查找 CSV
-    for csv_file in save_dir.glob("*.csv"):
+    for csv_file in save_dir.rglob("*.csv"):
         try:
             df = pd.read_csv(csv_file)
-            if metric_name in df.columns:
-                val = df[metric_name].iloc[0]
-                if pd.notna(val):
-                    return float(val)
+            csv_dataframes.append((str(csv_file), df))
         except Exception:
             continue
 
-    # 方式2: 解压 tar.gz
-    tar_files = list(save_dir.glob("*.csv.tar.gz"))
-    if tar_files:
-        latest_tar = max(tar_files, key=lambda p: p.stat().st_mtime)
+    # 方式2: 解压 tar.gz 中的 CSV
+    for tar_file in save_dir.rglob("*.csv.tar.gz"):
         try:
-            with tarfile.open(latest_tar, "r:gz") as tar:
+            with tarfile.open(tar_file, "r:gz") as tar:
                 for member in tar.getmembers():
                     if member.name.endswith(".csv"):
                         f = tar.extractfile(member)
@@ -472,32 +498,115 @@ def parse_trial_result(save_path, metric_name="march_accuracy_mean"):
                             continue
                         try:
                             df = pd.read_csv(f)
-                            if metric_name in df.columns:
-                                val = df[metric_name].iloc[0]
-                                if pd.notna(val):
-                                    return float(val)
+                            csv_dataframes.append((f"tar:{tar_file.name}/{member.name}", df))
                         except Exception:
                             continue
         except Exception:
-            pass
-
-    # 方式3: 递归搜索子目录
-    for csv_file in save_dir.rglob("*.csv"):
-        try:
-            df = pd.read_csv(csv_file)
-            if metric_name in df.columns:
-                val = df[metric_name].iloc[0]
-                if pd.notna(val):
-                    return float(val)
-        except Exception:
             continue
 
+    if not csv_dataframes:
+        print(f"  [警告] 未找到任何 CSV 结果文件")
+        return None
+
+    # 尝试精确匹配
+    for source, df in csv_dataframes:
+        if metric_name in df.columns:
+            val = df[metric_name].iloc[0]
+            if pd.notna(val):
+                print(f"  [解析] 在 {source} 中找到 {metric_name}={val}")
+                return float(val)
+            else:
+                print(f"  [调试] 在 {source} 中找到 {metric_name} 但值为 NaN")
+
+    # 如果目标指标为 NaN，尝试使用备选指标
+    fallback_metrics = ["march_accuracy_mean", "daily_accuracy", "rmse", "mae"]
+    for fallback in fallback_metrics:
+        if fallback == metric_name:
+            continue  # 已经试过了
+        for source, df in csv_dataframes:
+            if fallback in df.columns:
+                val = df[fallback].iloc[0]
+                if pd.notna(val):
+                    print(f"  [解析] 目标指标为 NaN，使用备选指标 {fallback}={val}")
+                    return float(val)
+
+    # 打印所有列名和值便于调试
+    print(f"  [调试] 精确匹配 '{metric_name}' 失败，所有结果文件内容:")
+    for source, df in csv_dataframes:
+        print(f"    {source}: {list(df.columns)[:10]}")
+
+    # 尝试模糊匹配
+    metric_lower = metric_name.lower()
+    for source, df in csv_dataframes:
+        for col in df.columns:
+            if metric_lower in col.lower() or col.lower() in metric_lower:
+                val = df[col].iloc[0]
+                if pd.notna(val):
+                    print(f"  [解析] 模糊匹配: 列 '{col}' ≈ '{metric_name}', 值={val}")
+                    return float(val)
+
+    # 尝试从 leaderboard 解析（常见格式: 模型名,指标1,指标2,...）
+    for source, df in csv_dataframes:
+        if "leaderboard" in source.lower() or len(df) == 1:
+            # 单行数据，取第一个数值型列
+            for col in df.columns:
+                try:
+                    val = float(df[col].iloc[0])
+                    if not pd.isna(val) and col not in ("model", "strategy", "dataset"):
+                        print(f"  [解析] leaderboard 列 '{col}' = {val}")
+                        return val
+                except (ValueError, TypeError):
+                    continue
+
+    print(f"  [警告] 所有解析方式均失败")
     return None
 
 
 # ============================================================
 # 调参主循环
 # ============================================================
+
+
+def validate_params(params):
+    """
+    校验超参数组合的合法性。
+
+    不合法的组合会导致模型训练失败（NaN），应提前拒绝。
+
+    Parameters
+    ----------
+    params : dict
+        超参数字典
+
+    Returns
+    -------
+    bool
+        参数组合是否合法
+    """
+    seq_len = params.get("seq_len", 96)
+    patch_len = params.get("patch_len", 96)
+    stride = params.get("stride", 48)
+    d_model = params.get("d_model", 256)
+    d_ff = params.get("d_ff", 128)
+
+    # patch_len 不能大于 seq_len
+    if patch_len > seq_len:
+        return False
+
+    # stride 不能大于 patch_len
+    if stride > patch_len:
+        return False
+
+    # patch 数量至少为 2（否则 Transformer 无法工作）
+    n_patches = int((seq_len - patch_len) / stride) + 2
+    if n_patches < 2:
+        return False
+
+    # d_ff 不应远大于 d_model（容易数值不稳定）
+    if d_ff > d_model * 4:
+        return False
+
+    return True
 
 
 def run_tune(search_space, base_args, n_trials, timeout, direction, db_path, log_file,
@@ -533,17 +642,18 @@ def run_tune(search_space, base_args, n_trials, timeout, direction, db_path, log
     db = TrialDB(db_path)
     rng = random.Random(42)
     n_random = int(n_trials * (1 - local_search_ratio))
+    max_skip = n_trials * 5  # 最多跳过的无效参数次数
+    skip_count = 0
 
-    for i in range(n_trials):
+    i = 0
+    while i < n_trials and skip_count < max_skip:
         trial_id = db.next_trial_id()
 
         # 选择采样策略
         if i < n_random:
-            # 随机搜索
             params = sample_params(search_space, rng)
             strategy = "random"
         else:
-            # 局部搜索：基于历史最优结果扰动
             best = db.get_best(direction)
             if best is not None:
                 params = perturb_params(best["params"], search_space, rng, strength=0.15)
@@ -555,6 +665,13 @@ def run_tune(search_space, base_args, n_trials, timeout, direction, db_path, log
         # 添加固定参数
         for key, val in fixed_params.items():
             params[key] = val
+
+        # 校验参数合法性
+        if not validate_params(params):
+            skip_count += 1
+            if skip_count <= 3:
+                print(f"  [跳过] 参数组合不合法 (已跳过 {skip_count} 次): {json.dumps(params)}")
+            continue
 
         params_str = json.dumps(params, ensure_ascii=False, indent=2)
         print(f"\n{'=' * 60}")
@@ -595,8 +712,13 @@ def run_tune(search_space, base_args, n_trials, timeout, direction, db_path, log
         else:
             print(
                 f"  >> Trial {trial_id}: 失败 ({result['status']}), "
-                f"错误={result.get('error', '')[:100]}"
+                f"错误={result.get('error', '')[:500]}"
             )
+
+        i += 1
+
+    if skip_count >= max_skip:
+        print(f"\n[警告] 跳过了 {skip_count} 次无效参数组合，已达到上限。请检查搜索空间。")
 
 
 # ============================================================
