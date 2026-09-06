@@ -23,12 +23,6 @@
       --endogenous-columns power,sr \\
       --target-column power
 
-  # 从 checkpoint 加载已训练模型 (跳过训练)
-  python inference.py --data dataset.csv --config-path config.json --checkpoint /path/to/model.pth
-
-  # 训练后保存 checkpoint (供下次 --checkpoint 加载, 避免重复训练)
-  python inference.py --data dataset.csv --config-path config.json --save-checkpoint /path/to/model.pth
-
   # 自定义模型架构开关
   python inference.py --data dataset.csv --config-path config.json \\
       --use-c true --use-t true --use-c-exog true --use-t-exog true \\
@@ -37,7 +31,6 @@
 
 import argparse
 import calendar
-import copy
 import json
 import logging
 import os
@@ -205,10 +198,6 @@ class DataPreprocessor:
 class ModelLoader:
     """
     模型加载模块: 实例化模型, 注入超参, 管理架构开关。
-
-    支持两种模式:
-      1. 全新训练: 实例化模型 → fit() → forecast()
-      2. Checkpoint 加载: 实例化模型 → 加载权重 → forecast()
     """
 
     def __init__(
@@ -268,91 +257,6 @@ class ModelLoader:
 
         return model
 
-    def load_checkpoint(self, model: Any, checkpoint_path: str) -> Any:
-        """
-        从 checkpoint 文件加载模型权重。
-
-        Parameters
-        ----------
-        model : Any
-            已实例化的模型对象
-        checkpoint_path : str
-            checkpoint 文件路径 (.pth / .pt)
-
-        Returns
-        -------
-        model : Any
-            加载权重后的模型对象
-        """
-        if not os.path.exists(checkpoint_path):
-            raise FileNotFoundError(f"Checkpoint 文件不存在: {checkpoint_path}")
-
-        import torch
-
-        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-
-        if "Model" in checkpoint:
-            model.model.load_state_dict(checkpoint["Model"])
-            logger.info(f"已加载模型权重: {checkpoint_path}")
-            if (
-                hasattr(model, "CovariateFusion")
-                and model.CovariateFusion is not None
-                and "CovariateFusion" in checkpoint
-            ):
-                model.CovariateFusion.load_state_dict(checkpoint["CovariateFusion"])
-                logger.info("已加载 CovariateFusion 权重")
-        else:
-            model.model.load_state_dict(checkpoint)
-            logger.info(f"已加载模型权重 (直接 state_dict): {checkpoint_path}")
-
-        model.check_point = checkpoint
-        return model
-
-    def save_checkpoint(self, model: Any, checkpoint_path: str) -> str:
-        """
-        将训练后的模型权重保存到 checkpoint 文件。
-
-        保存格式与 load_checkpoint 对称:
-          - 主模型权重放在 "Model" 键
-          - 若存在 CovariateFusion 模块, 其权重放在 "CovariateFusion" 键
-
-        Parameters
-        ----------
-        model : Any
-            已训练的模型对象 (具有 .model 属性, 可选 .CovariateFusion)
-        checkpoint_path : str
-            checkpoint 文件保存路径 (.pth / .pt)
-
-        Returns
-        -------
-        checkpoint_path : str
-            实际保存的 checkpoint 文件绝对路径
-        """
-        import torch
-
-        # 优先保存 check_point (训练过程中 EarlyStopping 维护的最佳权重)
-        # 若没有则用当前 model.state_dict()
-        if getattr(model, "check_point", None) is not None:
-            checkpoint = model.check_point
-            logger.info("保存训练过程中的最佳权重 (check_point)")
-        else:
-            checkpoint = {"Model": copy.deepcopy(model.model.state_dict())}
-            logger.info("保存当前模型权重 (model.state_dict)")
-
-        if (
-            hasattr(model, "CovariateFusion")
-            and model.CovariateFusion is not None
-            and "CovariateFusion" not in checkpoint
-        ):
-            checkpoint["CovariateFusion"] = copy.deepcopy(
-                model.CovariateFusion.state_dict()
-            )
-
-        os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
-        torch.save(checkpoint, checkpoint_path)
-        logger.info(f"模型 checkpoint 已保存: {checkpoint_path}")
-        return os.path.abspath(checkpoint_path)
-
 
 # =============================================================================
 # 模块 3: 推理执行
@@ -389,23 +293,37 @@ class InferenceEngine:
         self.train_ratio_in_tv = config.get("train_ratio_in_tv", 0.875)
         self.exclude_days = self._parse_exclude_days(config.get("exclude_days", []))
 
-        # capacity 匹配逻辑与 business_day_ahead._get_scalar_config_value 一致:
+        # capacity 匹配逻辑与 business_day_ahead._get_scalar_config_value 对齐:
         # 命令行 --capacity 优先; 否则按 series_name 匹配 config["capacity"] 字典;
+        # 为兼容 config 中键名带/不带 .csv 后缀两种写法, 依次尝试候选键;
         # 找不到再用 "__default__" 键; 都没有则报错.
         if capacity is not None:
             self.capacity = capacity
         else:
             cap = config.get("capacity", {})
             if isinstance(cap, dict):
-                if series_name in cap:
-                    self.capacity = cap[series_name]
+                # 候选键: 同时尝试带 .csv 后缀和不带后缀两种写法,
+                # 与框架 _get_scalar_config_value (使用完整 data_name 含后缀) 保持兼容
+                candidates = [series_name]
+                if series_name.endswith(".csv"):
+                    candidates.append(os.path.splitext(series_name)[0])
+                else:
+                    candidates.append(series_name + ".csv")
+                matched_key = next(
+                    (k for k in candidates if k in cap), None
+                )
+                if matched_key is not None:
+                    self.capacity = cap[matched_key]
+                    logger.debug(
+                        f"capacity 匹配键: '{matched_key}' (series_name='{series_name}')"
+                    )
                 elif "__default__" in cap:
                     self.capacity = cap["__default__"]
                 else:
                     raise ValueError(
-                        f"config capacity 字典中找不到 series_name='{series_name}', "
-                        f"且无 '__default__' 键. 请用 --capacity 指定, "
-                        f"或在 config 中添加该数据集的 capacity 条目. "
+                        f"config capacity 字典中找不到 series_name='{series_name}'"
+                        f"(已尝试候选键: {candidates}), 且无 '__default__' 键. "
+                        f"请用 --capacity 指定, 或在 config 中添加该数据集的 capacity 条目. "
                         f"现有键: {list(cap.keys())}"
                     )
             else:
@@ -940,56 +858,32 @@ def run_inference(args: argparse.Namespace) -> None:
     # series_name 用于匹配 config 中的 capacity 等按数据集区分的标量配置
     series_name = os.path.splitext(os.path.basename(args.data))[0]
 
-    # 从 checkpoint 加载 (如果指定)
-    if args.checkpoint and args.save_checkpoint:
-        logger.error("--checkpoint 与 --save-checkpoint 互斥: 前者加载已有权重跳过训练, 后者需要训练后保存")
-        sys.exit(1)
-    if args.checkpoint:
-        model = loader.load_checkpoint(model, args.checkpoint)
-        logger.info("从 checkpoint 加载模型, 跳过训练")
-    else:
-        # --- 6. 训练模型 ---
-        engine = InferenceEngine(
-            config=config,
-            target_column=target_column,
-            endogenous_columns=endogenous_columns,
-            capacity=args.capacity,
-            series_name=series_name,
-        )
-        month_start = pd.Timestamp(
-            engine.evaluation_year, engine.evaluation_month, 1
-        )
-        train_valid_data = series.loc[series.index < month_start]
-        if train_valid_data.empty:
-            raise ValueError(
-                f"评测月 {engine.evaluation_year}-{engine.evaluation_month:02d} "
-                f"之前没有训练数据"
-            )
-
-        target_train_valid, exog_train_valid = preprocessor.split_channels(
-            train_valid_data
-        )
-        model = engine.train_model(
-            model, target_train_valid, exog_train_valid
+    # --- 6. 训练模型 ---
+    engine = InferenceEngine(
+        config=config,
+        target_column=target_column,
+        endogenous_columns=endogenous_columns,
+        capacity=args.capacity,
+        series_name=series_name,
+    )
+    month_start = pd.Timestamp(
+        engine.evaluation_year, engine.evaluation_month, 1
+    )
+    train_valid_data = series.loc[series.index < month_start]
+    if train_valid_data.empty:
+        raise ValueError(
+            f"评测月 {engine.evaluation_year}-{engine.evaluation_month:02d} "
+            f"之前没有训练数据"
         )
 
-        # 训练完成后保存 checkpoint
-        if args.save_checkpoint:
-            loader.save_checkpoint(model, args.save_checkpoint)
+    target_train_valid, exog_train_valid = preprocessor.split_channels(
+        train_valid_data
+    )
+    model = engine.train_model(
+        model, target_train_valid, exog_train_valid
+    )
 
     # --- 7. 逐日推理 ---
-    if not args.checkpoint:
-        # 使用已初始化的 engine
-        pass
-    else:
-        engine = InferenceEngine(
-            config=config,
-            target_column=target_column,
-            endogenous_columns=endogenous_columns,
-            capacity=args.capacity,
-            series_name=series_name,
-        )
-
     all_actual, daily_accuracy, all_predicted, eval_days = engine.run(
         model=model,
         series=series,
@@ -1053,11 +947,6 @@ def main():
       --model-hyper-params '{"lr":0.001,"d_model":256}' \\
       --endogenous-columns power,sr
 
-  # 从 checkpoint 加载
-  python inference.py --data dataset.csv \\
-      --config-path config.json \\
-      --checkpoint /path/to/model.pth
-
   # 自定义架构开关
   python inference.py --data dataset.csv --config-path config.json \\
       --use-c true --use-t true --fusion-method mlp --loss Huber --norm true
@@ -1088,14 +977,6 @@ def main():
         help="模型超参 JSON 字符串",
     )
     parser.add_argument("--gpus", default="0", help="GPU 编号 (默认: 0)")
-    parser.add_argument(
-        "--checkpoint", default=None, help="模型 checkpoint 路径 (指定则跳过训练)"
-    )
-    parser.add_argument(
-        "--save-checkpoint", default=None,
-        help="训练完成后将模型权重保存到此路径 (如 model.pth)。"
-             "不指定则不保存。与 --checkpoint 互斥",
-    )
 
     # 架构开关
     parser.add_argument(
