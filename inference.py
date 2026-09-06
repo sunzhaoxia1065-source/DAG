@@ -26,6 +26,9 @@
   # 从 checkpoint 加载已训练模型 (跳过训练)
   python inference.py --data dataset.csv --config-path config.json --checkpoint /path/to/model.pth
 
+  # 训练后保存 checkpoint (供下次 --checkpoint 加载, 避免重复训练)
+  python inference.py --data dataset.csv --config-path config.json --save-checkpoint /path/to/model.pth
+
   # 自定义模型架构开关
   python inference.py --data dataset.csv --config-path config.json \\
       --use-c true --use-t true --use-c-exog true --use-t-exog true \\
@@ -34,6 +37,7 @@
 
 import argparse
 import calendar
+import copy
 import json
 import logging
 import os
@@ -303,6 +307,51 @@ class ModelLoader:
 
         model.check_point = checkpoint
         return model
+
+    def save_checkpoint(self, model: Any, checkpoint_path: str) -> str:
+        """
+        将训练后的模型权重保存到 checkpoint 文件。
+
+        保存格式与 load_checkpoint 对称:
+          - 主模型权重放在 "Model" 键
+          - 若存在 CovariateFusion 模块, 其权重放在 "CovariateFusion" 键
+
+        Parameters
+        ----------
+        model : Any
+            已训练的模型对象 (具有 .model 属性, 可选 .CovariateFusion)
+        checkpoint_path : str
+            checkpoint 文件保存路径 (.pth / .pt)
+
+        Returns
+        -------
+        checkpoint_path : str
+            实际保存的 checkpoint 文件绝对路径
+        """
+        import torch
+
+        # 优先保存 check_point (训练过程中 EarlyStopping 维护的最佳权重)
+        # 若没有则用当前 model.state_dict()
+        if getattr(model, "check_point", None) is not None:
+            checkpoint = model.check_point
+            logger.info("保存训练过程中的最佳权重 (check_point)")
+        else:
+            checkpoint = {"Model": copy.deepcopy(model.model.state_dict())}
+            logger.info("保存当前模型权重 (model.state_dict)")
+
+        if (
+            hasattr(model, "CovariateFusion")
+            and model.CovariateFusion is not None
+            and "CovariateFusion" not in checkpoint
+        ):
+            checkpoint["CovariateFusion"] = copy.deepcopy(
+                model.CovariateFusion.state_dict()
+            )
+
+        os.makedirs(os.path.dirname(os.path.abspath(checkpoint_path)), exist_ok=True)
+        torch.save(checkpoint, checkpoint_path)
+        logger.info(f"模型 checkpoint 已保存: {checkpoint_path}")
+        return os.path.abspath(checkpoint_path)
 
 
 # =============================================================================
@@ -803,6 +852,9 @@ def load_config(config_path: str) -> Dict:
     with open(config_path, "r", encoding="utf-8") as f:
         config = json.load(f)
 
+    if "evaluation_config" in config and "strategy_args" in config["evaluation_config"]:
+        return config["evaluation_config"]["strategy_args"]
+
     # 支持 __default__ 和 per-series 配置
     if "__default__" in config:
         return config["__default__"]
@@ -889,6 +941,9 @@ def run_inference(args: argparse.Namespace) -> None:
     series_name = os.path.splitext(os.path.basename(args.data))[0]
 
     # 从 checkpoint 加载 (如果指定)
+    if args.checkpoint and args.save_checkpoint:
+        logger.error("--checkpoint 与 --save-checkpoint 互斥: 前者加载已有权重跳过训练, 后者需要训练后保存")
+        sys.exit(1)
     if args.checkpoint:
         model = loader.load_checkpoint(model, args.checkpoint)
         logger.info("从 checkpoint 加载模型, 跳过训练")
@@ -917,6 +972,10 @@ def run_inference(args: argparse.Namespace) -> None:
         model = engine.train_model(
             model, target_train_valid, exog_train_valid
         )
+
+        # 训练完成后保存 checkpoint
+        if args.save_checkpoint:
+            loader.save_checkpoint(model, args.save_checkpoint)
 
     # --- 7. 逐日推理 ---
     if not args.checkpoint:
@@ -1031,6 +1090,11 @@ def main():
     parser.add_argument("--gpus", default="0", help="GPU 编号 (默认: 0)")
     parser.add_argument(
         "--checkpoint", default=None, help="模型 checkpoint 路径 (指定则跳过训练)"
+    )
+    parser.add_argument(
+        "--save-checkpoint", default=None,
+        help="训练完成后将模型权重保存到此路径 (如 model.pth)。"
+             "不指定则不保存。与 --checkpoint 互斥",
     )
 
     # 架构开关
