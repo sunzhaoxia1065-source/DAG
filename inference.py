@@ -44,6 +44,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 
+# 确保项目根目录在 sys.path 中, 以便找到 ts_benchmark 本地包
+# (ts_benchmark 未通过 pip 安装, 而是项目根目录下的本地包)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 # ts_benchmark 框架导入 (延迟导入, 仅在实际需要时加载)
 _TSB_AVAILABLE = False
 try:
@@ -319,6 +325,7 @@ class InferenceEngine:
         target_column: str = "power",
         endogenous_columns: Optional[List[str]] = None,
         capacity: Optional[float] = None,
+        series_name: str = "",
     ):
         self.config = config
         self.target_column = target_column
@@ -333,13 +340,25 @@ class InferenceEngine:
         self.train_ratio_in_tv = config.get("train_ratio_in_tv", 0.875)
         self.exclude_days = self._parse_exclude_days(config.get("exclude_days", []))
 
-        # capacity 可以是 dict 或标量
+        # capacity 匹配逻辑与 business_day_ahead._get_scalar_config_value 一致:
+        # 命令行 --capacity 优先; 否则按 series_name 匹配 config["capacity"] 字典;
+        # 找不到再用 "__default__" 键; 都没有则报错.
         if capacity is not None:
             self.capacity = capacity
         else:
             cap = config.get("capacity", {})
             if isinstance(cap, dict):
-                self.capacity = list(cap.values())[0] if cap else 100.0
+                if series_name in cap:
+                    self.capacity = cap[series_name]
+                elif "__default__" in cap:
+                    self.capacity = cap["__default__"]
+                else:
+                    raise ValueError(
+                        f"config capacity 字典中找不到 series_name='{series_name}', "
+                        f"且无 '__default__' 键. 请用 --capacity 指定, "
+                        f"或在 config 中添加该数据集的 capacity 条目. "
+                        f"现有键: {list(cap.keys())}"
+                    )
             else:
                 self.capacity = cap
 
@@ -866,6 +885,9 @@ def run_inference(args: argparse.Namespace) -> None:
     )
     model = loader.load()
 
+    # series_name 用于匹配 config 中的 capacity 等按数据集区分的标量配置
+    series_name = os.path.splitext(os.path.basename(args.data))[0]
+
     # 从 checkpoint 加载 (如果指定)
     if args.checkpoint:
         model = loader.load_checkpoint(model, args.checkpoint)
@@ -876,6 +898,8 @@ def run_inference(args: argparse.Namespace) -> None:
             config=config,
             target_column=target_column,
             endogenous_columns=endogenous_columns,
+            capacity=args.capacity,
+            series_name=series_name,
         )
         month_start = pd.Timestamp(
             engine.evaluation_year, engine.evaluation_month, 1
@@ -903,6 +927,8 @@ def run_inference(args: argparse.Namespace) -> None:
             config=config,
             target_column=target_column,
             endogenous_columns=endogenous_columns,
+            capacity=args.capacity,
+            series_name=series_name,
         )
 
     all_actual, daily_accuracy, all_predicted, eval_days = engine.run(
@@ -938,7 +964,6 @@ def run_inference(args: argparse.Namespace) -> None:
     output_dir = args.output_dir or os.path.join(
         os.path.dirname(args.data), "inference_results"
     )
-    series_name = os.path.splitext(os.path.basename(args.data))[0]
 
     ResultSaver.save_prediction_detail(
         all_actual, all_predicted, daily_accuracy, output_dir, series_name
