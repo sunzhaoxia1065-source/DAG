@@ -1,29 +1,43 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-独立模型推理脚本
+独立模型推理脚本 (气象公司在线评测版)
 
-功能: 接收新的时间范围数据集, 自动加载模型, 执行推理流程以生成 power 值预测结果,
-      并按照业务评测口径计算月度准确率指标。
+功能: 接收时间序列数据集, 训练 DAG 模型, 逐日执行推理生成 power 预测结果,
+      按业务评测口径计算日度/月度准确率, 并输出完整的月度预测 CSV 文件。
 
 模块结构:
-  1. DataPreprocessor  — 数据预处理 (读取、校验、内生/外生分离)
-  2. ModelLoader       — 模型加载 (实例化、超参注入、架构开关)
-  3. InferenceEngine   — 推理执行 (训练、逐日预测、结果收集)
+  1. DataPreprocessor   — 数据预处理 (读取、校验、内生/外生分离)
+  2. ModelLoader        — 模型加载 (实例化、超参注入、架构开关)
+  3. InferenceEngine    — 推理执行 (训练、逐日预测、排除日期跳过)
   4. AccuracyCalculator — 准确率计算 (weighted_accuracy、月度均值)
+  5. ResultSaver        — 结果输出 (月度预测CSV、日度准确率CSV、月度统计CSV)
+
+输出文件命名规范:
+  - monthly_prediction_{series}_{YYYYMM}.csv  — 完整月度 power 预测 (15 分钟间隔)
+  - daily_accuracy_{series}_{YYYYMM}.csv       — 每日准确率 + 月度均值行
+  - monthly_summary_{series}_{YYYYMM}.csv      — 月度统计 (均值/最大/最小/标准差/排除日期)
+  - prediction_detail_{series}.csv             — 逐点预测对比 (含所有内生变量)
 
 用法示例:
-  # 基本用法 (使用 config 中的默认参数)
-  python inference.py --data dataset.csv --config-path config/business_day_ahead_config.json
-
-  # 指定模型超参和内生变量
+  # 1. 指定评测月份 (气象公司在线评测)
   python inference.py --data dataset.csv \\
       --config-path config/business_day_ahead_config.json \\
-      --model-hyper-params '{"lr":0.001,"d_model":256,"seq_len":576,"patch_len":96,"stride":48}' \\
-      --endogenous-columns power,sr \\
-      --target-column power
+      --model-hyper-params '{"seq_len":96,"d_model":128}' \\
+      --endogenous-columns power,ws --target-column power \\
+      --evaluation-year 2026 --evaluation-month 3
 
-  # 自定义模型架构开关
+  # 2. 排除停机检修日
+  python inference.py --data dataset.csv --config-path config.json \\
+      --model-hyper-params '{...}' \\
+      --evaluation-month 3 \\
+      --exclude-days 2026-03-15,2026-03-16
+
+  # 3. 指定结果输出目录
+  python inference.py --data dataset.csv --config-path config.json \\
+      --output-dir results/march_2026
+
+  # 4. 自定义模型架构开关
   python inference.py --data dataset.csv --config-path config.json \\
       --use-c true --use-t true --use-c-exog true --use-t-exog true \\
       --fusion-method mlp --loss Huber
@@ -671,7 +685,55 @@ class AccuracyCalculator:
 # 结果保存
 # =============================================================================
 class ResultSaver:
-    """结果保存模块: 将预测结果和准确率保存为 CSV。"""
+    """结果保存模块: 将预测结果和准确率保存为 CSV。
+
+    输出文件命名规范:
+      - monthly_prediction_{series}_{YYYYMM}.csv  — 完整月度 power 预测 (15 分钟间隔)
+      - daily_accuracy_{series}_{YYYYMM}.csv       — 每日准确率
+      - monthly_summary_{series}_{YYYYMM}.csv      — 月度准确率统计汇总
+      - prediction_detail_{series}.csv             — 逐点预测对比 (含所有内生变量)
+    """
+
+    @staticmethod
+    def save_monthly_prediction(
+        all_actual: List[pd.DataFrame],
+        all_predicted: List[pd.DataFrame],
+        daily_accuracy: Dict[str, float],
+        eval_days: List[str],
+        output_dir: str,
+        series_name: str = "series",
+        year: int = 2026,
+        month: int = 3,
+    ) -> str:
+        """
+        保存完整月度 power 预测 CSV (15 分钟间隔, 非压缩格式)。
+
+        文件: {output_dir}/monthly_prediction_{series_name}_{YYYYMM}.csv
+        列: date, time, predicted_power, actual_power, error, daily_accuracy
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        rows = []
+        for actual_df, pred_df, day_str in zip(all_actual, all_predicted, eval_days):
+            acc = daily_accuracy.get(day_str, float("nan"))
+            for t in range(len(actual_df)):
+                a_val = actual_df.iloc[t, 0]
+                p_val = pred_df.iloc[t, 0]
+                rows.append({
+                    "date": day_str,
+                    "time": actual_df.index[t].strftime("%Y-%m-%d %H:%M:%S"),
+                    "predicted_power": p_val,
+                    "actual_power": a_val,
+                    "error": a_val - p_val,
+                    "daily_accuracy": acc,
+                })
+
+        month_tag = f"{year:04d}{month:02d}"
+        filename = f"monthly_prediction_{series_name}_{month_tag}.csv"
+        path = os.path.join(output_dir, filename)
+        pd.DataFrame(rows).to_csv(path, index=False)
+        logger.info(f"月度预测已保存: {path} ({len(rows)} 条, 15 分钟间隔)")
+        return path
 
     @staticmethod
     def save_prediction_detail(
@@ -723,11 +785,13 @@ class ResultSaver:
         output_dir: str,
         series_name: str = "series",
         metric_name: str = "june_accuracy_mean",
+        year: int = 2026,
+        month: int = 6,
     ) -> str:
         """
-        保存日度准确率汇总 CSV。
+        保存日度准确率 CSV。
 
-        文件: {output_dir}/daily_summary_{series_name}.csv
+        文件: {output_dir}/daily_accuracy_{series_name}_{YYYYMM}.csv
         列: date, daily_accuracy
         末尾: monthly_mean 行
         """
@@ -741,12 +805,57 @@ class ResultSaver:
             {"date": f"MONTHLY_MEAN ({metric_name})", "daily_accuracy": monthly_mean}
         )
 
+        month_tag = f"{year:04d}{month:02d}"
         summary_path = os.path.join(
-            output_dir, f"daily_summary_{series_name}.csv"
+            output_dir, f"daily_accuracy_{series_name}_{month_tag}.csv"
         )
         pd.DataFrame(rows).to_csv(summary_path, index=False)
         logger.info(f"日度准确率已保存: {summary_path}")
         return summary_path
+
+    @staticmethod
+    def save_monthly_summary(
+        daily_accuracy: Dict[str, float],
+        monthly_mean: float,
+        output_dir: str,
+        series_name: str = "series",
+        metric_name: str = "june_accuracy_mean",
+        year: int = 2026,
+        month: int = 6,
+        capacity: float = 0.0,
+        exclude_days: Optional[set] = None,
+    ) -> str:
+        """
+        保存月度准确率统计汇总 CSV。
+
+        文件: {output_dir}/monthly_summary_{series_name}_{YYYYMM}.csv
+        列: metric, value
+
+        包含排除日期记录, 便于气象公司审核停机检修日处理情况。
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        accs = list(daily_accuracy.values())
+        exclude_sorted = sorted(exclude_days) if exclude_days else []
+        rows = [
+            {"metric": "series_name", "value": series_name},
+            {"metric": "evaluation_year", "value": year},
+            {"metric": "evaluation_month", "value": month},
+            {"metric": "eval_day_count", "value": len(daily_accuracy)},
+            {"metric": "exclude_day_count", "value": len(exclude_sorted)},
+            {"metric": "exclude_days", "value": ",".join(exclude_sorted) if exclude_sorted else ""},
+            {"metric": "capacity_mw", "value": capacity},
+            {"metric": metric_name, "value": monthly_mean},
+            {"metric": "max_daily_accuracy", "value": max(accs) if accs else float("nan")},
+            {"metric": "min_daily_accuracy", "value": min(accs) if accs else float("nan")},
+            {"metric": "std_daily_accuracy", "value": float(np.std(accs)) if accs else float("nan")},
+        ]
+
+        month_tag = f"{year:04d}{month:02d}"
+        path = os.path.join(output_dir, f"monthly_summary_{series_name}_{month_tag}.csv")
+        pd.DataFrame(rows).to_csv(path, index=False)
+        logger.info(f"月度统计已保存: {path}")
+        return path
 
 
 # =============================================================================
@@ -805,6 +914,8 @@ def run_inference(args: argparse.Namespace) -> None:
         config["horizon"] = args.horizon
     if args.issue_hour is not None:
         config["issue_hour"] = args.issue_hour
+    if args.exclude_days:
+        config["exclude_days"] = args.exclude_days
 
     # --- 2. 解析内生/外生变量 ---
     target_column = args.target_column or config.get("target_column", "power")
@@ -918,11 +1029,21 @@ def run_inference(args: argparse.Namespace) -> None:
         os.path.dirname(args.data), "inference_results"
     )
 
+    ResultSaver.save_monthly_prediction(
+        all_actual, all_predicted, daily_accuracy, eval_days,
+        output_dir, series_name, engine.evaluation_year, engine.evaluation_month
+    )
     ResultSaver.save_prediction_detail(
         all_actual, all_predicted, daily_accuracy, output_dir, series_name
     )
     ResultSaver.save_daily_summary(
-        daily_accuracy, monthly_mean, output_dir, series_name, metric_name
+        daily_accuracy, monthly_mean, output_dir, series_name, metric_name,
+        engine.evaluation_year, engine.evaluation_month
+    )
+    ResultSaver.save_monthly_summary(
+        daily_accuracy, monthly_mean, output_dir, series_name, metric_name,
+        engine.evaluation_year, engine.evaluation_month, engine.capacity,
+        engine.exclude_days
     )
 
     print(f"\n结果已保存到: {output_dir}/")
@@ -1010,6 +1131,10 @@ def main():
     parser.add_argument("--capacity", type=float, default=None, help="装机容量 (MW)")
     parser.add_argument("--horizon", type=int, default=None, help="预测长度")
     parser.add_argument("--issue-hour", type=int, default=None, help="发布时刻")
+    parser.add_argument(
+        "--exclude-days", default=None,
+        help="排除日期 (逗号分隔, 如 2026-03-15,2026-03-16)。这些日期不参与评测",
+    )
 
     # 输出
     parser.add_argument(
@@ -1022,6 +1147,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # 解析 exclude_days 为列表
+    if args.exclude_days:
+        args.exclude_days = [d.strip() for d in args.exclude_days.split(",")]
+    else:
+        args.exclude_days = None
 
     # 解析布尔参数
     bool_map = {"true": True, "false": False, "1": True, "0": False}
