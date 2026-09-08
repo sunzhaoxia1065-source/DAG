@@ -1,32 +1,68 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-独立模型推理脚本
+独立模型推理脚本 (气象公司在线评测版)
 
-功能: 接收新的时间范围数据集, 自动加载模型, 执行推理流程以生成 power 值预测结果,
-      并按照业务评测口径计算月度准确率指标。
+功能: 接收时间序列数据集, 训练/加载 DAG 模型, 逐日执行推理生成 power 预测结果,
+      按业务评测口径计算日度/月度准确率, 并输出完整的月度预测 CSV 文件。
+
+支持两种推理模式:
+  模式 A (训练后推理): 从数据训练模型, 再逐日推理 (默认)
+  模式 B (加载预训练模型推理): 直接加载 .ckpt 模型文件推理, 跳过训练
+    → 适用场景: 用户无法自行训练模型 (缺 GPU/训练数据/时间),
+      直接使用他人训练好的模型文件进行推理
 
 模块结构:
-  1. DataPreprocessor  — 数据预处理 (读取、校验、内生/外生分离)
-  2. ModelLoader       — 模型加载 (实例化、超参注入、架构开关)
-  3. InferenceEngine   — 推理执行 (训练、逐日预测、结果收集)
+  1. DataPreprocessor   — 数据预处理 (读取、校验、内生/外生分离)
+  2. ModelLoader        — 模型加载 (实例化、超参注入、架构开关)
+  2.5 ModelSaver        — 模型保存/加载 (序列化权重+scaler+超参到 .ckpt 文件)
+  3. InferenceEngine    — 推理执行 (训练、逐日预测、排除日期跳过)
   4. AccuracyCalculator — 准确率计算 (weighted_accuracy、月度均值)
+  5. ResultSaver        — 结果输出 (月度预测CSV、日度准确率CSV、月度统计CSV)
+
+输出文件命名规范:
+  - monthly_prediction_{series}_{YYYYMM}.csv  — 完整月度 power 预测 (15 分钟间隔)
+  - daily_accuracy_{series}_{YYYYMM}.csv       — 每日准确率 + 月度均值行
+  - monthly_summary_{series}_{YYYYMM}.csv      — 月度统计 (均值/最大/最小/标准差/排除日期)
+  - prediction_detail_{series}.csv             — 逐点预测对比 (含所有内生变量)
 
 用法示例:
-  # 基本用法 (使用 config 中的默认参数)
-  python inference.py --data dataset.csv --config-path config/business_day_ahead_config.json
-
-  # 指定模型超参和内生变量
+  # 1. 指定评测月份 (气象公司在线评测)
   python inference.py --data dataset.csv \\
       --config-path config/business_day_ahead_config.json \\
-      --model-hyper-params '{"lr":0.001,"d_model":256,"seq_len":576,"patch_len":96,"stride":48}' \\
-      --endogenous-columns power,sr \\
-      --target-column power
+      --model-hyper-params '{"seq_len":96,"d_model":128}' \\
+      --endogenous-columns power,ws --target-column power \\
+      --evaluation-year 2026 --evaluation-month 3
 
-  # 自定义模型架构开关
+  # 2. 排除停机检修日
+  python inference.py --data dataset.csv --config-path config.json \\
+      --model-hyper-params '{...}' \\
+      --evaluation-month 3 \\
+      --exclude-days 2026-03-15,2026-03-16
+
+  # 3. 指定结果输出目录
+  python inference.py --data dataset.csv --config-path config.json \\
+      --output-dir results/march_2026
+
+  # 4. 自定义模型架构开关
   python inference.py --data dataset.csv --config-path config.json \\
       --use-c true --use-t true --use-c-exog true --use-t-exog true \\
       --fusion-method mlp --loss Huber
+
+  # 5. 训练模型并保存 (供后续直接加载推理)
+  python inference.py --data dataset.csv \\
+      --config-path config/business_day_ahead_config.json \\
+      --save-model checkpoints/dag_model.ckpt
+
+  # 6. 加载预训练模型直接推理 (无法自行训练的场景)
+  python inference.py --data dataset.csv \\
+      --config-path config/business_day_ahead_config.json \\
+      --load-model checkpoints/dag_model.ckpt \\
+      --evaluation-year 2026 --evaluation-month 3
+
+  # 编程式 API 调用 (见文件末尾样例函数):
+  #   example_train_save_load_inference()  — 训练→保存→加载→推理 完整流程
+  #   example_load_pretrained_only()        — 直接加载预训练模型推理
 """
 
 import argparse
@@ -256,6 +292,302 @@ class ModelLoader:
             raise RuntimeError(f"模型实例化失败: {e}") from e
 
         return model
+
+
+# =============================================================================
+# 模块 2.5: 模型保存/加载
+# =============================================================================
+class ModelSaver:
+    """
+    模型保存/加载模块。
+
+    将训练好的模型 (权重 + scaler + 超参配置) 序列化为单个 .ckpt 文件,
+    可在无需重新训练的情况下直接加载用于推理。
+
+    保存内容 (torch.save 序列化的 dict):
+      - model_state_dict: DAGModel 权重 (优先使用 best checkpoint)
+      - covariate_fusion_state_dict: CovariateFusion 模块权重 (可选)
+      - scaler1_state / scaler2_state: StandardScaler 参数 (mean_, scale_, var_)
+      - config_dict: 完整超参配置 (含训练时推导的 series_dim, enc_in, label_len 等)
+      - model_name: 模型路径 (如 "dag.DAG")
+      - metadata: 保存时间、数据集名等元信息
+
+    使用场景:
+      用户 A 训练好模型后保存 -> 用户 B 加载模型直接推理, 无需训练。
+    """
+
+    @staticmethod
+    def save_model(
+        model: Any,
+        model_name: str,
+        save_path: str,
+        series_name: str = "",
+    ) -> str:
+        """
+        保存训练好的模型到磁盘。
+
+        Parameters
+        ----------
+        model : Any
+            已训练的模型实例 (DeepForecastingModelBase 子类)
+        model_name : str
+            模型路径 (如 "dag.DAG")
+        save_path : str
+            保存文件路径 (建议 .ckpt 或 .pt 后缀)
+        series_name : str
+            数据集名称 (记录在 metadata 中, 便于追溯)
+
+        Returns
+        -------
+        str
+            保存的文件路径
+        """
+        import torch
+
+        # 收集模型权重: 优先使用 check_point 中的最佳权重
+        model_state = None
+        if hasattr(model, "check_point") and model.check_point is not None:
+            model_state = model.check_point.get("Model")
+        if model_state is None and model.model is not None:
+            model_state = model.model.state_dict()
+        if model_state is None:
+            raise ValueError("模型未训练, 无法保存")
+
+        # CovariateFusion 权重
+        cf_state = None
+        has_cf = (
+            hasattr(model, "CovariateFusion")
+            and model.CovariateFusion is not None
+        )
+        if has_cf:
+            cf_state = model.CovariateFusion.state_dict()
+
+        # Scaler 参数 (始终 fit, 即使 norm=False)
+        scaler1_state = None
+        if hasattr(model.scaler1, "mean_"):
+            scaler1_state = {
+                "mean_": model.scaler1.mean_,
+                "scale_": model.scaler1.scale_,
+                "var_": model.scaler1.var_,
+                "n_features_in_": getattr(
+                    model.scaler1, "n_features_in_", None
+                ),
+            }
+
+        scaler2_state = None
+        if hasattr(model.scaler2, "mean_"):
+            scaler2_state = {
+                "mean_": model.scaler2.mean_,
+                "scale_": model.scaler2.scale_,
+                "var_": model.scaler2.var_,
+                "n_features_in_": getattr(
+                    model.scaler2, "n_features_in_", None
+                ),
+            }
+
+        # Config: 序列化所有属性 (含训练时推导的 series_dim 等)
+        config_dict = dict(vars(model.config))
+
+        save_data = {
+            "model_state_dict": model_state,
+            "covariate_fusion_state_dict": cf_state,
+            "has_covariate_fusion": has_cf,
+            "scaler1_state": scaler1_state,
+            "scaler2_state": scaler2_state,
+            "config_dict": config_dict,
+            "model_name": model_name,
+            "metadata": {
+                "series_name": series_name,
+                "save_time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        }
+
+        save_dir = os.path.dirname(save_path)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+
+        torch.save(save_data, save_path)
+        logger.info(f"模型已保存: {save_path}")
+        return save_path
+
+    @staticmethod
+    def load_model(
+        load_path: str,
+        model_name: str = "dag.DAG",
+        gpus: str = "0",
+    ) -> Any:
+        """
+        从磁盘加载训练好的模型, 返回可直接推理的模型实例。
+
+        Parameters
+        ----------
+        load_path : str
+            模型文件路径
+        model_name : str
+            模型路径 (如 "dag.DAG"), 作为回退
+        gpus : str
+            GPU 编号
+
+        Returns
+        -------
+        Any
+            已加载权重的模型实例, 可直接调用 forecast()
+
+        Raises
+        ------
+        FileNotFoundError
+            模型文件不存在
+        RuntimeError
+            模型加载失败
+        """
+        import torch
+        from sklearn.preprocessing import StandardScaler
+
+        if not os.path.exists(load_path):
+            raise FileNotFoundError(f"模型文件不存在: {load_path}")
+
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+
+        # weights_only=False: 保存的 dict 含 numpy array 等 非 tensor 对象
+        save_data = torch.load(
+            load_path, map_location="cpu", weights_only=False
+        )
+
+        saved_config = save_data["config_dict"]
+        effective_model_name = save_data.get("model_name", model_name)
+
+        if not _TSB_AVAILABLE:
+            raise ImportError(
+                "ts_benchmark 框架未安装, 请确保在正确的环境中运行此脚本"
+            )
+
+        # 通过 model_loader 获取模型工厂
+        model_config = {"model_name": effective_model_name}
+        model_info = get_model_info(model_config)
+
+        if isinstance(model_info, dict):
+            model_factory = model_info["model_factory"]
+        elif callable(model_info):
+            model_factory = model_info
+        else:
+            raise RuntimeError(f"无法解析模型信息: {model_info}")
+
+        # 用保存的完整 config 初始化模型实例
+        # (DeepForecastingModelBase.__init__ 会设置 scaler1/scaler2 占位)
+        model = model_factory(**saved_config)
+
+        # 恢复 config 属性 (确保训练时推导的属性都被恢复)
+        for k, v in saved_config.items():
+            setattr(model.config, k, v)
+
+        # 初始化 PyTorch 模型并加载权重
+        # _init_model 依赖 config 中的 series_dim, enc_in, label_len 等
+        model.model = model._init_model()
+        model.model.load_state_dict(save_data["model_state_dict"])
+
+        # 恢复 CovariateFusion
+        if save_data.get("has_covariate_fusion", False):
+            from ts_benchmark.baselines.utils import MLP, Conv, CrossAttention
+
+            fm = model.config.fusion_method
+            if fm == "mlp":
+                model.CovariateFusion = MLP(model.config)
+            elif fm == "cross_attention":
+                model.CovariateFusion = CrossAttention(model.config)
+            elif fm == "conv":
+                model.CovariateFusion = Conv(model.config)
+            else:
+                model.CovariateFusion = None
+
+            if model.CovariateFusion is not None and save_data.get(
+                "covariate_fusion_state_dict"
+            ):
+                model.CovariateFusion.load_state_dict(
+                    save_data["covariate_fusion_state_dict"]
+                )
+        else:
+            model.CovariateFusion = None
+
+        # 恢复 scaler
+        if save_data.get("scaler1_state") is not None:
+            model.scaler1 = StandardScaler()
+            s1 = save_data["scaler1_state"]
+            model.scaler1.mean_ = s1["mean_"]
+            model.scaler1.scale_ = s1["scale_"]
+            model.scaler1.var_ = s1["var_"]
+            if s1.get("n_features_in_") is not None:
+                model.scaler1.n_features_in_ = s1["n_features_in_"]
+
+        if save_data.get("scaler2_state") is not None:
+            model.scaler2 = StandardScaler()
+            s2 = save_data["scaler2_state"]
+            model.scaler2.mean_ = s2["mean_"]
+            model.scaler2.scale_ = s2["scale_"]
+            model.scaler2.var_ = s2["var_"]
+            if s2.get("n_features_in_") is not None:
+                model.scaler2.n_features_in_ = s2["n_features_in_"]
+
+        # check_point 设为 None: 权重已直接加载到 self.model
+        model.check_point = None
+
+        logger.info(
+            f"模型已加载: {load_path}\n"
+            f"  model_name: {effective_model_name}\n"
+            f"  series_dim: {saved_config.get('series_dim')}\n"
+            f"  input_dim: {saved_config.get('input_dim')}\n"
+            f"  pred_dim: {saved_config.get('pred_dim')}\n"
+            f"  fusion_method: {saved_config.get('fusion_method')}\n"
+            f"  save_time: {save_data.get('metadata', {}).get('save_time')}"
+        )
+        return model
+
+    @staticmethod
+    def validate_compatibility(
+        model: Any,
+        endogenous_columns: List[str],
+        df: pd.DataFrame,
+    ) -> None:
+        """
+        校验加载的模型与当前数据集是否兼容。
+
+        检查:
+          - 内生变量数 (len(endogenous_columns)) 是否与模型 series_dim 一致
+          - 外生变量数 (df 列数 - 内生列数) 是否与模型 exog_dim 一致
+
+        Parameters
+        ----------
+        model : Any
+            已加载的模型实例
+        endogenous_columns : List[str]
+            当前数据集的内生变量列名
+        df : pd.DataFrame
+            当前数据集 (含内生+外生列)
+
+        Raises
+        ------
+        ValueError
+            维度不匹配
+        """
+        config = model.config
+        saved_series_dim = config.series_dim
+        saved_input_dim = config.input_dim
+        saved_exog_dim = saved_input_dim - saved_series_dim
+
+        actual_series_dim = len(endogenous_columns)
+        actual_exog_dim = len(df.columns) - actual_series_dim
+
+        if actual_series_dim != saved_series_dim:
+            raise ValueError(
+                f"内生变量数不匹配: 模型训练时 series_dim={saved_series_dim}, "
+                f"但当前数据集有 {actual_series_dim} 个内生变量 "
+                f"({endogenous_columns})"
+            )
+
+        if actual_exog_dim != saved_exog_dim:
+            raise ValueError(
+                f"外生变量数不匹配: 模型训练时 exog_dim={saved_exog_dim}, "
+                f"但当前数据集有 {actual_exog_dim} 个外生变量"
+            )
 
 
 # =============================================================================
@@ -671,7 +1003,55 @@ class AccuracyCalculator:
 # 结果保存
 # =============================================================================
 class ResultSaver:
-    """结果保存模块: 将预测结果和准确率保存为 CSV。"""
+    """结果保存模块: 将预测结果和准确率保存为 CSV。
+
+    输出文件命名规范:
+      - monthly_prediction_{series}_{YYYYMM}.csv  — 完整月度 power 预测 (15 分钟间隔)
+      - daily_accuracy_{series}_{YYYYMM}.csv       — 每日准确率
+      - monthly_summary_{series}_{YYYYMM}.csv      — 月度准确率统计汇总
+      - prediction_detail_{series}.csv             — 逐点预测对比 (含所有内生变量)
+    """
+
+    @staticmethod
+    def save_monthly_prediction(
+        all_actual: List[pd.DataFrame],
+        all_predicted: List[pd.DataFrame],
+        daily_accuracy: Dict[str, float],
+        eval_days: List[str],
+        output_dir: str,
+        series_name: str = "series",
+        year: int = 2026,
+        month: int = 3,
+    ) -> str:
+        """
+        保存完整月度 power 预测 CSV (15 分钟间隔, 非压缩格式)。
+
+        文件: {output_dir}/monthly_prediction_{series_name}_{YYYYMM}.csv
+        列: date, time, predicted_power, actual_power, error, daily_accuracy
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        rows = []
+        for actual_df, pred_df, day_str in zip(all_actual, all_predicted, eval_days):
+            acc = daily_accuracy.get(day_str, float("nan"))
+            for t in range(len(actual_df)):
+                a_val = actual_df.iloc[t, 0]
+                p_val = pred_df.iloc[t, 0]
+                rows.append({
+                    "date": day_str,
+                    "time": actual_df.index[t].strftime("%Y-%m-%d %H:%M:%S"),
+                    "predicted_power": p_val,
+                    "actual_power": a_val,
+                    "error": a_val - p_val,
+                    "daily_accuracy": acc,
+                })
+
+        month_tag = f"{year:04d}{month:02d}"
+        filename = f"monthly_prediction_{series_name}_{month_tag}.csv"
+        path = os.path.join(output_dir, filename)
+        pd.DataFrame(rows).to_csv(path, index=False)
+        logger.info(f"月度预测已保存: {path} ({len(rows)} 条, 15 分钟间隔)")
+        return path
 
     @staticmethod
     def save_prediction_detail(
@@ -723,11 +1103,13 @@ class ResultSaver:
         output_dir: str,
         series_name: str = "series",
         metric_name: str = "june_accuracy_mean",
+        year: int = 2026,
+        month: int = 6,
     ) -> str:
         """
-        保存日度准确率汇总 CSV。
+        保存日度准确率 CSV。
 
-        文件: {output_dir}/daily_summary_{series_name}.csv
+        文件: {output_dir}/daily_accuracy_{series_name}_{YYYYMM}.csv
         列: date, daily_accuracy
         末尾: monthly_mean 行
         """
@@ -741,12 +1123,57 @@ class ResultSaver:
             {"date": f"MONTHLY_MEAN ({metric_name})", "daily_accuracy": monthly_mean}
         )
 
+        month_tag = f"{year:04d}{month:02d}"
         summary_path = os.path.join(
-            output_dir, f"daily_summary_{series_name}.csv"
+            output_dir, f"daily_accuracy_{series_name}_{month_tag}.csv"
         )
         pd.DataFrame(rows).to_csv(summary_path, index=False)
         logger.info(f"日度准确率已保存: {summary_path}")
         return summary_path
+
+    @staticmethod
+    def save_monthly_summary(
+        daily_accuracy: Dict[str, float],
+        monthly_mean: float,
+        output_dir: str,
+        series_name: str = "series",
+        metric_name: str = "june_accuracy_mean",
+        year: int = 2026,
+        month: int = 6,
+        capacity: float = 0.0,
+        exclude_days: Optional[set] = None,
+    ) -> str:
+        """
+        保存月度准确率统计汇总 CSV。
+
+        文件: {output_dir}/monthly_summary_{series_name}_{YYYYMM}.csv
+        列: metric, value
+
+        包含排除日期记录, 便于气象公司审核停机检修日处理情况。
+        """
+        os.makedirs(output_dir, exist_ok=True)
+
+        accs = list(daily_accuracy.values())
+        exclude_sorted = sorted(exclude_days) if exclude_days else []
+        rows = [
+            {"metric": "series_name", "value": series_name},
+            {"metric": "evaluation_year", "value": year},
+            {"metric": "evaluation_month", "value": month},
+            {"metric": "eval_day_count", "value": len(daily_accuracy)},
+            {"metric": "exclude_day_count", "value": len(exclude_sorted)},
+            {"metric": "exclude_days", "value": ",".join(exclude_sorted) if exclude_sorted else ""},
+            {"metric": "capacity_mw", "value": capacity},
+            {"metric": metric_name, "value": monthly_mean},
+            {"metric": "max_daily_accuracy", "value": max(accs) if accs else float("nan")},
+            {"metric": "min_daily_accuracy", "value": min(accs) if accs else float("nan")},
+            {"metric": "std_daily_accuracy", "value": float(np.std(accs)) if accs else float("nan")},
+        ]
+
+        month_tag = f"{year:04d}{month:02d}"
+        path = os.path.join(output_dir, f"monthly_summary_{series_name}_{month_tag}.csv")
+        pd.DataFrame(rows).to_csv(path, index=False)
+        logger.info(f"月度统计已保存: {path}")
+        return path
 
 
 # =============================================================================
@@ -784,12 +1211,24 @@ def load_config(config_path: str) -> Dict:
 # =============================================================================
 def run_inference(args: argparse.Namespace) -> None:
     """
-    完整推理流程: 加载数据 → 实例化模型 → 训练 → 逐日推理 → 计算准确率 → 保存结果。
+    完整推理流程:
+
+    模式 A (训练后推理):
+      加载数据 → 实例化模型 → 训练 → [可选保存模型] → 逐日推理 → 计算准确率 → 保存结果
+
+    模式 B (加载预训练模型直接推理):
+      加载数据 → 加载模型 → 逐日推理 → 计算准确率 → 保存结果
+
+    通过 --load-model 切换模式:
+      - 未指定 --load-model: 走模式 A (训练后推理), 可用 --save-model 保存训练好的模型
+      - 指定 --load-model PATH: 走模式 B (直接加载 PATH 处的模型进行推理, 跳过训练)
 
     Parameters
     ----------
     args : argparse.Namespace
-        命令行参数
+        命令行参数, 关键字段:
+        - load_model: 预训练模型路径 (指定后跳过训练)
+        - save_model: 模型保存路径 (训练后保存, 供后续直接加载)
     """
     # --- 1. 加载配置 ---
     config = load_config(args.config_path)
@@ -805,6 +1244,8 @@ def run_inference(args: argparse.Namespace) -> None:
         config["horizon"] = args.horizon
     if args.issue_hour is not None:
         config["issue_hour"] = args.issue_hour
+    if args.exclude_days:
+        config["exclude_days"] = args.exclude_days
 
     # --- 2. 解析内生/外生变量 ---
     target_column = args.target_column or config.get("target_column", "power")
@@ -815,31 +1256,7 @@ def run_inference(args: argparse.Namespace) -> None:
             "endogenous_columns", [target_column]
         )
 
-    # --- 3. 解析模型超参 ---
-    model_hp = {}
-    if args.model_hyper_params:
-        model_hp = json.loads(args.model_hyper_params)
-
-    # 注入架构开关 (命令行参数优先)
-    arch_flags = {
-        "use_c": args.use_c,
-        "use_c_exog": args.use_c_exog,
-        "use_t": args.use_t,
-        "use_t_exog": args.use_t_exog,
-        "fusion_method": args.fusion_method,
-        "loss": args.loss,
-        "norm": args.norm,
-        "horizon": config.get("horizon", 156),
-    }
-    for k, v in arch_flags.items():
-        if v is not None:
-            model_hp[k] = v
-
-    # pred_dim: 只预测 power (内生变量中的第一个目标列)
-    if "pred_dim" not in model_hp:
-        model_hp["pred_dim"] = 1
-
-    # --- 4. 数据预处理 ---
+    # --- 3. 数据预处理 ---
     preprocessor = DataPreprocessor(
         data_path=args.data,
         target_column=target_column,
@@ -847,18 +1264,22 @@ def run_inference(args: argparse.Namespace) -> None:
     )
     series = preprocessor.load_and_validate()
 
-    # --- 5. 模型加载 ---
-    loader = ModelLoader(
-        model_name=args.model_name,
-        model_hyper_params=model_hp,
-        gpus=args.gpus,
-    )
-    model = loader.load()
+    # --- 3.5 设置随机种子 (与 run_benchmark.py 的 ForecastingStrategy 对齐) ---
+    _seed = config.get("seed", 2021)
+    _deterministic = config.get("deterministic", "efficient")
+    if _deterministic == "full":
+        from ts_benchmark.utils.random_utils import fix_all_random_seed
+        fix_all_random_seed(_seed)
+        logger.info(f"随机种子已设置 (full): seed={_seed}")
+    elif _deterministic == "efficient":
+        from ts_benchmark.utils.random_utils import fix_random_seed
+        fix_random_seed(_seed)
+        logger.info(f"随机种子已设置 (efficient): seed={_seed}")
 
     # series_name 用于匹配 config 中的 capacity 等按数据集区分的标量配置
     series_name = os.path.splitext(os.path.basename(args.data))[0]
 
-    # --- 6. 训练模型 ---
+    # --- 4. 创建推理引擎 (训练和加载模式都需要) ---
     engine = InferenceEngine(
         config=config,
         target_column=target_column,
@@ -866,24 +1287,88 @@ def run_inference(args: argparse.Namespace) -> None:
         capacity=args.capacity,
         series_name=series_name,
     )
-    month_start = pd.Timestamp(
-        engine.evaluation_year, engine.evaluation_month, 1
-    )
-    train_valid_data = series.loc[series.index < month_start]
-    if train_valid_data.empty:
-        raise ValueError(
-            f"评测月 {engine.evaluation_year}-{engine.evaluation_month:02d} "
-            f"之前没有训练数据"
+
+    # --- 5. 模型加载或训练 ---
+    if args.load_model:
+        # ===== 模式 B: 加载预训练模型, 跳过训练 =====
+        if args.save_model:
+            logger.warning(
+                "同时指定了 --load-model 和 --save-model, --save-model 将被忽略 "
+                "(加载的模型无需重新保存)"
+            )
+        logger.info(f"加载预训练模型: {args.load_model}")
+        model = ModelSaver.load_model(
+            load_path=args.load_model,
+            model_name=args.model_name,
+            gpus=args.gpus,
+        )
+        # 校验模型与当前数据集的维度兼容性
+        ModelSaver.validate_compatibility(
+            model, endogenous_columns, series
+        )
+        logger.info("预训练模型加载完成, 跳过训练阶段")
+    else:
+        # ===== 模式 A: 实例化 + 训练 =====
+        # --- 5a. 解析模型超参 ---
+        model_hp = {}
+        if args.model_hyper_params:
+            model_hp = json.loads(args.model_hyper_params)
+
+        # 注入架构开关 (命令行参数优先)
+        arch_flags = {
+            "use_c": args.use_c,
+            "use_c_exog": args.use_c_exog,
+            "use_t": args.use_t,
+            "use_t_exog": args.use_t_exog,
+            "fusion_method": args.fusion_method,
+            "loss": args.loss,
+            "norm": args.norm,
+            "horizon": config.get("horizon", 156),
+        }
+        for k, v in arch_flags.items():
+            if v is not None:
+                model_hp[k] = v
+
+        # pred_dim: 只预测 power (内生变量中的第一个目标列)
+        if "pred_dim" not in model_hp:
+            model_hp["pred_dim"] = 1
+
+        # --- 5b. 实例化模型 ---
+        loader = ModelLoader(
+            model_name=args.model_name,
+            model_hyper_params=model_hp,
+            gpus=args.gpus,
+        )
+        model = loader.load()
+
+        # --- 5c. 训练模型 ---
+        month_start = pd.Timestamp(
+            engine.evaluation_year, engine.evaluation_month, 1
+        )
+        train_valid_data = series.loc[series.index < month_start]
+        if train_valid_data.empty:
+            raise ValueError(
+                f"评测月 {engine.evaluation_year}-{engine.evaluation_month:02d} "
+                f"之前没有训练数据"
+            )
+
+        target_train_valid, exog_train_valid = preprocessor.split_channels(
+            train_valid_data
+        )
+        model = engine.train_model(
+            model, target_train_valid, exog_train_valid
         )
 
-    target_train_valid, exog_train_valid = preprocessor.split_channels(
-        train_valid_data
-    )
-    model = engine.train_model(
-        model, target_train_valid, exog_train_valid
-    )
+        # --- 5d. 保存训练好的模型 (可选) ---
+        if args.save_model:
+            ModelSaver.save_model(
+                model=model,
+                model_name=args.model_name,
+                save_path=args.save_model,
+                series_name=series_name,
+            )
 
-    # --- 7. 逐日推理 ---
+    # --- 6. 逐日推理 ---
     all_actual, daily_accuracy, all_predicted, eval_days = engine.run(
         model=model,
         series=series,
@@ -918,11 +1403,21 @@ def run_inference(args: argparse.Namespace) -> None:
         os.path.dirname(args.data), "inference_results"
     )
 
+    ResultSaver.save_monthly_prediction(
+        all_actual, all_predicted, daily_accuracy, eval_days,
+        output_dir, series_name, engine.evaluation_year, engine.evaluation_month
+    )
     ResultSaver.save_prediction_detail(
         all_actual, all_predicted, daily_accuracy, output_dir, series_name
     )
     ResultSaver.save_daily_summary(
-        daily_accuracy, monthly_mean, output_dir, series_name, metric_name
+        daily_accuracy, monthly_mean, output_dir, series_name, metric_name,
+        engine.evaluation_year, engine.evaluation_month
+    )
+    ResultSaver.save_monthly_summary(
+        daily_accuracy, monthly_mean, output_dir, series_name, metric_name,
+        engine.evaluation_year, engine.evaluation_month, engine.capacity,
+        engine.exclude_days
     )
 
     print(f"\n结果已保存到: {output_dir}/")
@@ -937,19 +1432,42 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 示例:
-  # 基本推理
+  # 1. 基本推理 (训练后推理)
   python inference.py --data dataset.csv \\
       --config-path config/business_day_ahead_config.json
 
-  # 指定超参和内生变量
+  # 2. 指定超参和内生变量
   python inference.py --data dataset.csv \\
       --config-path config.json \\
       --model-hyper-params '{"lr":0.001,"d_model":256}' \\
       --endogenous-columns power,sr
 
-  # 自定义架构开关
+  # 3. 自定义架构开关
   python inference.py --data dataset.csv --config-path config.json \\
       --use-c true --use-t true --fusion-method mlp --loss Huber --norm true
+
+  # 4. 训练模型并保存 (供后续直接加载推理)
+  python inference.py --data dataset.csv \\
+      --config-path config/business_day_ahead_config.json \\
+      --save-model checkpoints/dag_model.ckpt
+
+  # 5. 加载预训练模型直接推理 (无需训练, 适用无法自行训练的场景)
+  python inference.py --data dataset.csv \\
+      --config-path config/business_day_ahead_config.json \\
+      --load-model checkpoints/dag_model.ckpt \\
+      --evaluation-year 2026 --evaluation-month 3
+
+  # 6. 训练保存 + 后续加载 (两步流程)
+  # 步骤1: 用户A训练并保存模型
+  python inference.py --data train_data.csv \\
+      --config-path config.json \\
+      --save-model checkpoints/dag_ninghe.ckpt \\
+      --evaluation-year 2026 --evaluation-month 2
+  # 步骤2: 用户B加载模型对3月数据推理
+  python inference.py --data eval_data.csv \\
+      --config-path config.json \\
+      --load-model checkpoints/dag_ninghe.ckpt \\
+      --evaluation-year 2026 --evaluation-month 3
         """,
     )
 
@@ -1010,10 +1528,26 @@ def main():
     parser.add_argument("--capacity", type=float, default=None, help="装机容量 (MW)")
     parser.add_argument("--horizon", type=int, default=None, help="预测长度")
     parser.add_argument("--issue-hour", type=int, default=None, help="发布时刻")
+    parser.add_argument(
+        "--exclude-days", default=None,
+        help="排除日期 (逗号分隔, 如 2026-03-15,2026-03-16)。这些日期不参与评测",
+    )
 
     # 输出
     parser.add_argument(
         "--output-dir", default=None, help="结果输出目录 (默认: 数据集同目录/inference_results)"
+    )
+
+    # 模型保存/加载
+    parser.add_argument(
+        "--save-model", default=None,
+        help="训练后将模型保存到此路径 (如 checkpoints/dag_model.ckpt), "
+             "供后续 --load-model 直接加载",
+    )
+    parser.add_argument(
+        "--load-model", default=None,
+        help="加载预训练模型路径 (如 checkpoints/dag_model.ckpt), "
+             "指定后跳过训练直接推理, 适用无法自行训练的场景",
     )
 
     # 日志
@@ -1022,6 +1556,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # 解析 exclude_days 为列表
+    if args.exclude_days:
+        args.exclude_days = [d.strip() for d in args.exclude_days.split(",")]
+    else:
+        args.exclude_days = None
 
     # 解析布尔参数
     bool_map = {"true": True, "false": False, "1": True, "0": False}
@@ -1054,6 +1594,228 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
+
+# =============================================================================
+# 推理样例代码 (编程式 API)
+# =============================================================================
+# 以下函数展示了如何不通过命令行, 直接用 Python 代码调用本模块的各个组件
+# 完成模型训练、保存、加载和推理。适合集成到其他 Python 脚本或服务中。
+#
+# 样例 1: 训练 → 保存模型 → 加载模型 → 推理 (完整两步流程)
+# 样例 2: 直接加载预训练模型进行推理 (无法自行训练的场景)
+# =============================================================================
+
+
+def example_train_save_load_inference():
+    """
+    样例 1: 完整两步流程 — 训练保存模型, 再加载模型推理。
+
+    场景: 用户 A 在有训练数据和 GPU 的环境训练并保存模型,
+          用户 B 在推理环境加载模型直接预测, 无需训练。
+
+    前置条件:
+      - 数据集 CSV: time, power, sr, [外生变量...] 列, 15 分钟间隔
+      - 配置文件: config/business_day_ahead_config.json
+    """
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    DATA_PATH = "dataset.csv"
+    CONFIG_PATH = "config/business_day_ahead_config.json"
+    MODEL_PATH = "checkpoints/dag_model.ckpt"
+    OUTPUT_DIR = "inference_results"
+
+    # ===== 步骤 1: 训练并保存模型 =====
+    config = load_config(CONFIG_PATH)
+
+    # 数据预处理
+    preprocessor = DataPreprocessor(
+        data_path=DATA_PATH,
+        target_column="power",
+        endogenous_columns=["power", "sr"],
+    )
+    series = preprocessor.load_and_validate()
+
+    # 设置随机种子
+    from ts_benchmark.utils.random_utils import fix_random_seed
+    fix_random_seed(config.get("seed", 2021))
+
+    # 实例化模型
+    model_hp = {
+        "seq_len": 96,
+        "horizon": 156,
+        "pred_dim": 1,
+        "norm": True,
+        "loss": "MAE",
+        "use_c": True,
+        "use_t": True,
+        "use_c_exog": True,
+        "use_t_exog": True,
+    }
+    loader = ModelLoader(model_name="dag.DAG", model_hyper_params=model_hp)
+    model = loader.load()
+
+    # 训练
+    engine = InferenceEngine(
+        config=config,
+        target_column="power",
+        endogenous_columns=["power", "sr"],
+        series_name="dataset",
+    )
+    month_start = pd.Timestamp(
+        engine.evaluation_year, engine.evaluation_month, 1
+    )
+    train_valid_data = series.loc[series.index < month_start]
+    target_train_valid, exog_train_valid = preprocessor.split_channels(
+        train_valid_data
+    )
+    model = engine.train_model(model, target_train_valid, exog_train_valid)
+
+    # 保存模型
+    ModelSaver.save_model(
+        model=model,
+        model_name="dag.DAG",
+        save_path=MODEL_PATH,
+        series_name="dataset",
+    )
+    print(f"模型已保存到 {MODEL_PATH}, 可分发给其他用户直接加载推理")
+
+    # ===== 步骤 2: 加载模型直接推理 (模拟用户 B) =====
+    # 重新加载数据 (用户 B 可能使用不同的评测月份)
+    series_name = os.path.splitext(os.path.basename(DATA_PATH))[0]
+    series = preprocessor.load_and_validate()
+
+    # 加载预训练模型
+    model_loaded = ModelSaver.load_model(
+        load_path=MODEL_PATH,
+        model_name="dag.DAG",
+    )
+
+    # 校验模型与数据兼容性
+    ModelSaver.validate_compatibility(
+        model_loaded, ["power", "sr"], series
+    )
+
+    # 创建推理引擎 (可使用不同的评测月份)
+    engine_eval = InferenceEngine(
+        config=config,
+        target_column="power",
+        endogenous_columns=["power", "sr"],
+        series_name=series_name,
+    )
+
+    # 逐日推理
+    all_actual, daily_accuracy, all_predicted, eval_days = engine_eval.run(
+        model=model_loaded,
+        series=series,
+        endogenous_columns=["power", "sr"],
+    )
+
+    # 计算准确率并保存
+    monthly_mean = AccuracyCalculator.monthly_mean(daily_accuracy)
+    metric_name = AccuracyCalculator.get_monthly_metric_name(
+        engine_eval.evaluation_month
+    )
+
+    ResultSaver.save_monthly_prediction(
+        all_actual, all_predicted, daily_accuracy, eval_days,
+        OUTPUT_DIR, series_name,
+        engine_eval.evaluation_year, engine_eval.evaluation_month,
+    )
+    ResultSaver.save_daily_summary(
+        daily_accuracy, monthly_mean, OUTPUT_DIR,
+        series_name, metric_name,
+        engine_eval.evaluation_year, engine_eval.evaluation_month,
+    )
+
+    print(f"\n月度准确率均值 ({metric_name}): {monthly_mean:.4f}")
+    print(f"结果已保存到: {OUTPUT_DIR}/")
+
+
+def example_load_pretrained_only():
+    """
+    样例 2: 直接加载预训练模型推理 (无法自行训练的场景)。
+
+    场景: 用户无法自行训练模型 (缺少 GPU/训练数据/时间),
+          直接使用他人训练好的 .ckpt 文件进行推理。
+
+    前置条件:
+      - 预训练模型文件: checkpoints/dag_model.ckpt (由其他用户通过 --save-model 生成)
+      - 评测数据集 CSV: 含 time, power, sr, [外生变量...] 列, 15 分钟间隔
+      - 配置文件: config/business_day_ahead_config.json (评测参数需与训练时一致)
+
+    等效 CLI 命令:
+      python inference.py --data dataset.csv \\
+          --config-path config/business_day_ahead_config.json \\
+          --load-model checkpoints/dag_model.ckpt
+    """
+    import logging
+    logging.basicConfig(level=logging.INFO)
+
+    DATA_PATH = "dataset.csv"
+    CONFIG_PATH = "config/business_day_ahead_config.json"
+    MODEL_PATH = "checkpoints/dag_model.ckpt"
+    OUTPUT_DIR = "inference_results"
+
+    # 加载配置
+    config = load_config(CONFIG_PATH)
+
+    # 数据预处理
+    endogenous_columns = config.get("endogenous_columns", ["power"])
+    target_column = config.get("target_column", "power")
+
+    preprocessor = DataPreprocessor(
+        data_path=DATA_PATH,
+        target_column=target_column,
+        endogenous_columns=endogenous_columns,
+    )
+    series = preprocessor.load_and_validate()
+    series_name = os.path.splitext(os.path.basename(DATA_PATH))[0]
+
+    # === 核心: 加载预训练模型 (无需训练) ===
+    model = ModelSaver.load_model(
+        load_path=MODEL_PATH,
+        model_name="dag.DAG",
+    )
+
+    # 校验模型与数据集维度兼容
+    ModelSaver.validate_compatibility(model, endogenous_columns, series)
+
+    # 创建推理引擎
+    engine = InferenceEngine(
+        config=config,
+        target_column=target_column,
+        endogenous_columns=endogenous_columns,
+        series_name=series_name,
+    )
+
+    # 逐日推理
+    all_actual, daily_accuracy, all_predicted, eval_days = engine.run(
+        model=model,
+        series=series,
+        endogenous_columns=endogenous_columns,
+    )
+
+    # 计算准确率
+    monthly_mean = AccuracyCalculator.monthly_mean(daily_accuracy)
+    metric_name = AccuracyCalculator.get_monthly_metric_name(
+        engine.evaluation_month
+    )
+    print(f"\n月度准确率均值 ({metric_name}): {monthly_mean:.4f}")
+
+    # 保存结果
+    ResultSaver.save_monthly_prediction(
+        all_actual, all_predicted, daily_accuracy, eval_days,
+        OUTPUT_DIR, series_name,
+        engine.evaluation_year, engine.evaluation_month,
+    )
+    ResultSaver.save_daily_summary(
+        daily_accuracy, monthly_mean, OUTPUT_DIR,
+        series_name, metric_name,
+        engine.evaluation_year, engine.evaluation_month,
+    )
+    print(f"结果已保存到: {OUTPUT_DIR}/")
 
 
 if __name__ == "__main__":
