@@ -46,6 +46,7 @@ import math
 import os
 import sys
 import time
+from datetime import datetime  
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -60,6 +61,40 @@ logger = logging.getLogger(__name__)
 
 TIME_COL = "time"
 POINTS_PER_DAY = 96  # 15 分钟分辨率, 24*4=96
+PERIOD = 96  # 周期长度: 1天 = 96 个 15min 点 (光伏异常0值周期插补用)
+
+# =============================================================================
+# 光伏列分类系统 (异常0值检测用, 与 merge_csv_ninghe.py 对齐)
+# =============================================================================
+# - nighttime_zero: 全天为0才算异常 (限电), 夜间为0正常 (power/sr)
+# - solar: 白天时段 (07:00~19:00) 全为0才算异常 (太阳辐射)
+# - never_zero: 任何时刻为0即为异常 (热辐射/湿度/露点), 全时段检测
+# - other: 不检测
+COLUMN_CLASSIFICATION: Dict[str, str] = {
+    "power": "nighttime_zero",
+    "sr": "nighttime_zero",
+    "total_sky_direct_solar_radiation_at_surface_surface": "solar",
+    "surface_thermal_radiation_downwards_surface": "never_zero",
+    "relative_humidity_isobaric_950": "never_zero",
+    "relatively_humidity_isobaric_950": "never_zero",  # 兼容变体
+    "dewpoint_temperature_surface_2_metre": "never_zero",
+    "dewpoint_temperature_surface_2metre": "never_zero",  # 兼容变体
+}
+_SOLAR_KEYWORDS = ["direct_solar", "日照"]
+_NEVER_ZERO_KEYWORDS = ["thermal_radiation", "humidity", "热辐射", "湿度"]
+
+
+def classify_column(col: str) -> str:
+    """光伏列分类: 显式字典优先, 关键词回退, 都不命中返回 'other'."""
+    if col in COLUMN_CLASSIFICATION:
+        return COLUMN_CLASSIFICATION[col]
+    col_lower = col.lower()
+    if any(k in col_lower for k in _NEVER_ZERO_KEYWORDS):
+        return "never_zero"
+    if any(k in col_lower for k in _SOLAR_KEYWORDS):
+        return "solar"
+    return "other"
+
 
 # 5x5 网格定义 (郝家营二期风电场)
 WIND_LAT_RANGE = [41.2, 41.3, 41.4, 41.5, 41.6]
@@ -172,7 +207,7 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def parse_time(time_val) -> pd.Timestamp:
     """解析多种时间格式"""
-    if isinstance(time_val, (pd.Timestamp, pd.datetime)):
+    if isinstance(time_val, (pd.Timestamp, datetime)):
         return pd.Timestamp(time_val)
     s = str(time_val).strip()
     if s.isdigit() and len(s) == 12:
@@ -214,6 +249,7 @@ class DataProcessor:
         periodic_neighbors: int = 3,
         features: List[str] = None,
         features_file: str = None,
+        test_cutoff: str = None,
         log_file: str = None,
     ):
         self.ec_data_path = ec_data_path
@@ -222,6 +258,7 @@ class DataProcessor:
         self.center_grid = center_grid
         self.fill_method = fill_method
         self.periodic_neighbors = periodic_neighbors
+        self.test_cutoff = test_cutoff  # 测试期起始日期 (光伏内生变量不检测此日期之后)
 
         # 时间过滤: 统一转为 YYYYMMDDHHmm 12 位数字 (用于字符串比较)
         self.time_start = self._normalize_time_filter(time_start)
@@ -548,7 +585,11 @@ class DataProcessor:
         merged = power_df.merge(merge_df_join, on="_timestamp", how="left")
         self.logger.info(f"合并后: 行={len(merged)}, 列={len(merged.columns)}")
 
-        # 缺失值检测
+        # 异常0值检测与处理 (钩子: 风电默认跳过, 光伏重写为完整逻辑)
+        data_cols = [c for c in merged.columns if c not in (TIME_COL, "_timestamp")]
+        merged = self._handle_special_zero_values(merged, data_cols)
+
+        # 常规缺失值检测
         data_cols = [c for c in merged.columns if c not in (TIME_COL, "_timestamp")]
         before_miss = sum(merged[c].isna().sum() for c in data_cols)
         self.logger.info(f"处理前缺失值总数: {before_miss}")
@@ -661,6 +702,14 @@ class DataProcessor:
                 else:
                     df[col] = s.fillna(0).astype("float32")
                     self.logger.warning(f"  均值填充 {col}: 列全空, 用 0 填充 {n_miss} 个")
+        return df
+
+    # ------------------------------------------------------------------
+    # 异常0值处理钩子 (风电默认跳过, 光伏重写)
+    # ------------------------------------------------------------------
+    def _handle_special_zero_values(self, df: pd.DataFrame, data_cols: List[str]) -> pd.DataFrame:
+        """基类默认: 跳过异常0值检测 (风电只需常规NaN填充)"""
+        self.logger.info("异常0值检测: 跳过 (风电场景只处理NaN缺失值)")
         return df
 
     # ------------------------------------------------------------------
@@ -971,6 +1020,165 @@ class SolarDataProcessor(DataProcessor):
         self.logger.info("=" * 60)
         return None
 
+    # ------------------------------------------------------------------
+    # 光伏异常0值检测与处理 (与 merge_csv_ninghe.py 对齐)
+    # ------------------------------------------------------------------
+    def _handle_special_zero_values(self, df: pd.DataFrame, data_cols: List[str]) -> pd.DataFrame:
+        """光伏: 检测并处理异常0值 (限电日/太阳辐射白天为0/热辐射湿度不应为0)"""
+        self.logger.info("-" * 40)
+        self.logger.info("光伏异常0值检测 (nighttime_zero/solar/never_zero)")
+        special_cases = self._detect_special_cases(df, data_cols)
+        if special_cases:
+            self.logger.info(f"检测到 {len(special_cases)} 个异常区间, 开始处理...")
+            df = self._handle_special_cases_impl(df, special_cases)
+        else:
+            self.logger.info("未检测到异常0值")
+        return df
+
+    def _detect_special_cases(
+        self, df: pd.DataFrame, target_columns: List[str],
+        zero_threshold: float = 0.0, daytime_start: int = 7, daytime_end: int = 19,
+    ) -> List[Dict]:
+        """检测异常0值, 按列类型和昼夜规律分类 (与 merge_csv_ninghe.py 对齐)"""
+        if not target_columns:
+            return []
+        df = df.copy()
+        df["_hour"] = df["_timestamp"].dt.hour
+        df["_date"] = df["_timestamp"].dt.date
+        test_cutoff_date = None
+        if self.test_cutoff:
+            try:
+                test_cutoff_date = pd.Timestamp(self.test_cutoff).date()
+                self.logger.info(f"测试期起始: {self.test_cutoff}, 内生变量不检测此日期之后")
+            except Exception:
+                self.logger.warning(f"无法解析 test_cutoff '{self.test_cutoff}', 忽略")
+        results: List[Dict] = []
+        for col in target_columns:
+            if col not in df.columns:
+                self.logger.warning(f"检测列不存在: '{col}', 跳过")
+                continue
+            col_type = classify_column(col)
+            if col_type == "other":
+                self.logger.info(f"列 '{col}' 分类为 'other', 跳过特殊检测")
+                continue
+            is_endogenous = col_type == "nighttime_zero"
+            for date, day_df in df.groupby("_date"):
+                if is_endogenous and test_cutoff_date and date >= test_cutoff_date:
+                    continue
+                is_abnormal = False
+                if col_type == "nighttime_zero":
+                    is_abnormal = (day_df[col].abs() <= zero_threshold).all()
+                elif col_type == "solar":
+                    day_hours = day_df[(day_df["_hour"] >= daytime_start) & (day_df["_hour"] < daytime_end)]
+                    if day_hours.empty:
+                        continue
+                    is_abnormal = (day_hours[col].abs() <= zero_threshold).all()
+                elif col_type == "never_zero":
+                    zero_mask = day_df[col].abs() <= zero_threshold
+                    if zero_mask.any():
+                        is_abnormal = True
+                if is_abnormal:
+                    if col_type == "never_zero":
+                        zero_rows = day_df[day_df[col].abs() <= zero_threshold]
+                        start_idx, end_idx = zero_rows.index[0], zero_rows.index[-1]
+                        start_time = df.loc[start_idx, "_timestamp"]
+                        end_time = df.loc[end_idx, "_timestamp"]
+                        results.append({"column": col, "col_type": col_type, "date": str(date),
+                            "start_time": start_time, "end_time": end_time,
+                            "duration_hours": round((end_time - start_time).total_seconds() / 3600, 2),
+                            "row_count": len(zero_rows), "start_idx": int(start_idx), "end_idx": int(end_idx)})
+                    else:
+                        start_time = day_df["_timestamp"].iloc[0]
+                        end_time = day_df["_timestamp"].iloc[-1]
+                        start_idx, end_idx = day_df.index[0], day_df.index[-1]
+                        results.append({"column": col, "col_type": col_type, "date": str(date),
+                            "start_time": start_time, "end_time": end_time,
+                            "duration_hours": round((end_time - start_time).total_seconds() / 3600, 2),
+                            "row_count": len(day_df), "start_idx": int(start_idx), "end_idx": int(end_idx)})
+        df = df.drop(columns=["_hour", "_date"])
+        if results:
+            self.logger.info(f"检测到 {len(results)} 个异常0值区间:")
+            for r in results:
+                self.logger.info(f"  列 '{r['column']}' [{r['col_type']}]: {r['date']}, {r['row_count']} 行")
+        return results
+
+    def _handle_special_cases_impl(self, df: pd.DataFrame, special_cases: List[Dict]) -> pd.DataFrame:
+        """处理异常0值: never_zero强制插值, nighttime_zero/solar按fill_method"""
+        df = df.copy()
+        never_zero_cases = [c for c in special_cases if c.get("col_type") == "never_zero"]
+        other_cases = [c for c in special_cases if c.get("col_type") != "never_zero"]
+        # never_zero 类: 强制插值替换 (忽略策略)
+        if never_zero_cases:
+            for case in never_zero_cases:
+                col = case["column"]
+                mask = (df.index >= case["start_idx"]) & (df.index <= case["end_idx"])
+                zero_mask = mask & (df[col].abs() <= 1e-10)
+                if zero_mask.any():
+                    df.loc[zero_mask, col] = np.nan
+            for col in set(c["column"] for c in never_zero_cases):
+                if col in df.columns:
+                    df[col] = df[col].interpolate(method="linear", limit_direction="both")
+                    df[col] = df[col].ffill().bfill()
+            self.logger.info(f"never_zero 类处理: {len(never_zero_cases)} 个区间, 插值替换")
+        # nighttime_zero / solar 类
+        if not other_cases or self.fill_method == "keep":
+            if other_cases:
+                self.logger.info("nighttime_zero/solar 类: 保留不处理 (fill_method=keep)")
+            return df
+        if self.fill_method == "drop":
+            drop_indices = set()
+            for case in other_cases:
+                drop_indices.update(range(case["start_idx"], case["end_idx"] + 1))
+            drop_indices = drop_indices & set(df.index)
+            before_len = len(df)
+            df = df.drop(index=drop_indices).reset_index(drop=True)
+            self.logger.info(f"nighttime_zero/solar 处理(删除): {before_len} -> {len(df)} 行")
+        elif self.fill_method in ("mean", "fill_mean", "fill_median"):
+            for case in other_cases:
+                col = case["column"]
+                mask = (df.index >= case["start_idx"]) & (df.index <= case["end_idx"])
+                non_special = df.loc[~mask, col]
+                fill_val = non_special.mean() if self.fill_method in ("mean", "fill_mean") else non_special.median()
+                df.loc[mask, col] = fill_val
+            self.logger.info(f"nighttime_zero/solar 处理({self.fill_method}): {len(other_cases)} 个区间")
+        elif self.fill_method == "interpolate":
+            for case in other_cases:
+                col = case["column"]
+                mask = (df.index >= case["start_idx"]) & (df.index <= case["end_idx"])
+                df.loc[mask, col] = np.nan
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            df[numeric_cols] = df[numeric_cols].interpolate(method="linear", limit_direction="both")
+            df[numeric_cols] = df[numeric_cols].ffill().bfill()
+            self.logger.info(f"nighttime_zero/solar 处理(插值): {len(other_cases)} 个区间")
+        elif self.fill_method == "fill_periodic_mean":
+            neighbors = self.periodic_neighbors
+            total_len = len(df)
+            for case in other_cases:
+                col = case["column"]
+                start_idx, end_idx = case["start_idx"], case["end_idx"]
+                positions_in_period = np.arange(start_idx, end_idx + 1) % PERIOD
+                case_period_num = start_idx // PERIOD
+                min_period = max(0, case_period_num - neighbors)
+                max_period = min((total_len - 1) // PERIOD, case_period_num + neighbors)
+                fill_values = np.full(end_idx - start_idx + 1, np.nan)
+                for i, pos in enumerate(positions_in_period):
+                    neighbor_values = []
+                    for p in range(min_period, max_period + 1):
+                        if p == case_period_num:
+                            continue
+                        idx = p * PERIOD + pos
+                        if 0 <= idx < total_len:
+                            val = df.loc[idx, col]
+                            if not pd.isna(val):
+                                neighbor_values.append(val)
+                    fill_values[i] = np.mean(neighbor_values) if neighbor_values else 0.0
+                for i, idx in enumerate(range(start_idx, end_idx + 1)):
+                    df.loc[idx, col] = fill_values[i]
+            self.logger.info(f"nighttime_zero/solar 处理(多周期平均, 前后各{neighbors}天): {len(other_cases)} 个区间")
+        else:
+            self.logger.warning(f"未知异常处理策略: {self.fill_method}, 跳过 nighttime_zero/solar 类处理")
+        return df
+
     def step4_merge_master(self, split_dir: str = None, gradient_dir: str = None) -> str:
         """光伏 Step 4: 仅加载主文件, 跳过 25 点风速和梯度合并"""
         split_dir = split_dir or getattr(self, "_split_dir", "")
@@ -1090,8 +1298,9 @@ def main():
     parser.add_argument("--time-start", default="202407030000", help="起始时间 (YYYYMMDDHHmm, 默认 202407030000)")
     parser.add_argument("--time-end", default="202607312345", help="结束时间 (YYYYMMDDHHmm, 默认 202607312345)")
     parser.add_argument("--center-grid", default=None, help="中心网格点坐标 (如 41_400_114_900), 不指定则用第一个点")
-    parser.add_argument("--fill-method", default="fill_periodic_mean", choices=["fill_periodic_mean", "interpolate", "mean"], help="缺失值填充方法: fill_periodic_mean(默认) / interpolate(线性插值) / mean(均值填充)")
+    parser.add_argument("--fill-method", default="fill_periodic_mean", choices=["fill_periodic_mean", "interpolate", "mean", "keep"], help="缺失值填充方法: fill_periodic_mean(默认) / interpolate(线性插值) / mean(均值填充) / keep(光伏异常0值保留不处理)")
     parser.add_argument("--periodic-neighbors", type=int, default=3, help="周期插补前后天数 (默认 3)")
+    parser.add_argument("--test-cutoff", default=None, help="光伏测试期起始日期 (如 2026-03-01), 内生变量(power/sr)不检测此日期之后的异常0值, 保护评估数据")
     parser.add_argument("--steps", default=None, help="执行步骤 (逗号分隔, 如 1,2,5,6; 默认全部)")
     parser.add_argument("--features", default=None, help="自定义特征列表 (逗号分隔, 如 'time,power,ws,u_wind_component_surface_10_metre')")
     parser.add_argument("--features-file", default=None, help="从文件加载自定义特征列表 (每行一个或逗号分隔)")
@@ -1119,6 +1328,7 @@ def main():
             periodic_neighbors=args.periodic_neighbors,
             features=custom_features,
             features_file=args.features_file,
+            test_cutoff=args.test_cutoff,
         )
     else:
         processor = SolarDataProcessor(
@@ -1132,6 +1342,7 @@ def main():
             periodic_neighbors=args.periodic_neighbors,
             features=custom_features,
             features_file=args.features_file,
+            test_cutoff=args.test_cutoff,
         )
 
     # 覆盖网格范围
