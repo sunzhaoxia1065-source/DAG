@@ -1,0 +1,3 @@
+python tools/inference.py --data dataset/forecasting/haojiaying_renew_select.csv \
+    --config-path config/business_day_ahead_renew.json \
+    --save-model checkpoints/dag_model_haojiaying_june.ckpt --model-hyper-params '{"alpha": 0.5, "batch_size": 32, "d_ff": 128, "d_model": 128, "dropout": 0.5, "e_layers": 1, "fusion_method": "mlp", "horizon": 156, "loss": "MSE", "lr": 0.002280585045892031, "lradj": "type3", "mlp_hidden_dims": 64, "n_heads": 8, "norm": true, "patch_len": 48, "patience": 4, "seq_len": 96, "stride": 48, "use_c": true, "use_c_exog": true, "use_t": true, "use_t_exog": true}' --evaluation-year 2026 --evaluation-month 6
